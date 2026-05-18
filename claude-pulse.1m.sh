@@ -1,122 +1,150 @@
 #!/bin/bash
-# SwiftBar plugin: working-state dot + OR/CC usage stats in the menubar.
-# Filename: claude-pulse.1m.sh (refresh every 1 minute).
+# SwiftBar plugin: working-state dot + OR/DS/CC/Codex usage.
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 CLAUDE_DIR="$HOME/.claude"
+CODEX_DIR="$HOME/.codex"
 CC_CACHE="/tmp/claude-pulse-cc.json"
 OR_CACHE="/tmp/claude-pulse-or.json"
 DS_CACHE="/tmp/claude-pulse-ds.json"
 
-# --- Credentials ---
-TOKEN=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null \
-    | jq -r '.claudeAiOauth.accessToken // empty')
+TOKEN=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null |
+    jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
 OR_KEY=$(security find-generic-password -s "openrouter-api-key" -w 2>/dev/null)
 DS_KEY=$(security find-generic-password -s "deepseek-api-key" -w 2>/dev/null)
 
-# --- Parallel fetch (5s timeout) ---
-TMP_CC=$(mktemp); TMP_OR=$(mktemp); TMP_DS=$(mktemp)
+TMP_CC=$(mktemp)
+TMP_OR=$(mktemp)
+TMP_DS=$(mktemp)
 trap 'rm -f "$TMP_CC" "$TMP_OR" "$TMP_DS"' EXIT
 
 [[ -n "$TOKEN" ]] && curl -s --max-time 5 "https://api.anthropic.com/api/oauth/usage" \
     -H "Authorization: Bearer $TOKEN" \
     -H "anthropic-beta: oauth-2025-04-20" \
-    -H "User-Agent: claude-code/2.0.31" > "$TMP_CC" &
-[[ -n "$OR_KEY" ]] && curl -s --max-time 5 https://openrouter.ai/api/v1/credits \
-    -H "Authorization: Bearer $OR_KEY" > "$TMP_OR" &
+    -H "User-Agent: claude-code/2.0.31" >"$TMP_CC" &
+[[ -n "$OR_KEY" ]] && curl -s --max-time 5 "https://openrouter.ai/api/v1/credits" \
+    -H "Authorization: Bearer $OR_KEY" >"$TMP_OR" &
 [[ -n "$DS_KEY" ]] && curl -s --max-time 5 "https://api.deepseek.com/user/balance" \
-    -H "Authorization: Bearer $DS_KEY" > "$TMP_DS" &
+    -H "Authorization: Bearer $DS_KEY" >"$TMP_DS" &
 wait
 
-# Per-segment state: absent | ok | stale | down. Fresh fetch wins, else cached, else down.
 resolve() {
-    local fresh="$1" cache="$2" out_var="$3"
-    if [[ -s "$fresh" ]] && ! jq -e '.error' < "$fresh" >/dev/null 2>&1; then
-        cp "$fresh" "$cache"
-        printf -v "$out_var" 'ok'
-    elif [[ -s "$cache" ]]; then
-        printf -v "$out_var" 'stale'
+    if [[ -s "$1" ]] && ! jq -e '.error' <"$1" >/dev/null 2>&1; then
+        cp "$1" "$2"
+        printf -v "$3" ok
+    elif [[ -s "$2" ]]; then
+        printf -v "$3" stale
     else
-        printf -v "$out_var" 'down'
+        printf -v "$3" down
     fi
 }
-CC_STATE=absent; OR_STATE=absent; DS_STATE=absent
-[[ -n "$TOKEN"  ]] && resolve "$TMP_CC" "$CC_CACHE" CC_STATE
+
+mark() {
+    case "$1" in
+        stale) printf '⏳' ;;
+        down) printf '⚠️' ;;
+    esac
+}
+
+remaining() {
+    local raw="$1" epoch diff
+    [[ -z "$raw" || "$raw" == null ]] && return
+    if [[ "$raw" =~ ^[0-9]+$ ]]; then
+        epoch="$raw"
+    else
+        raw="${raw%%.*}"
+        raw="${raw%%+*}"
+        raw="${raw%Z}"
+        epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%S" "$raw" "+%s" 2>/dev/null) || return
+    fi
+    diff=$((epoch - $(date "+%s")))
+    ((diff <= 0)) && echo now && return
+    ((diff < 3600)) && echo "$((diff / 60))m" && return
+    ((diff < 86400)) && echo "$((diff / 3600))h$((diff % 3600 / 60))m" && return
+    echo "$((diff / 86400))d$((diff % 86400 / 3600))h"
+}
+
+usage_segment() {
+    local label="$1" seven="$2" five="$3" seven_reset="$4" five_reset="$5" state="$6"
+    local seven_rem five_rem
+    seven_rem=$(remaining "$seven_reset")
+    five_rem=$(remaining "$five_reset")
+    if [[ -n "$seven_rem" || -n "$five_rem" ]]; then
+        printf '%s%s: 7d:%.0f%%(%s) 5h:%.0f%%(%s)' "$(mark "$state")" "$label" "$seven" "$seven_rem" "$five" "$five_rem"
+    else
+        printf '%s%s: 7d:%.0f%% 5h:%.0f%%' "$(mark "$state")" "$label" "$seven" "$five"
+    fi
+}
+
+recent_jsonl() {
+    local cutoff
+    cutoff=$(($(date "+%s") - 90))
+    find "$1" -type f -name '*.jsonl' -mtime -1 -print 2>/dev/null |
+        xargs stat -f '%m' 2>/dev/null |
+        awk -v cutoff="$cutoff" '$1 >= cutoff { found = 1 } END { exit !found }'
+}
+
+codex_line() {
+    find "$CODEX_DIR/sessions" -type f -name '*.jsonl' -mtime -7 -print 2>/dev/null |
+        xargs stat -f '%m %N' 2>/dev/null |
+        sort -rn |
+        while read -r _ file; do
+            line=$(jq -c 'select((.rate_limits // .payload.rate_limits).primary and (.rate_limits // .payload.rate_limits).secondary)' "$file" 2>/dev/null | tail -n 1)
+            [[ -n "$line" ]] && echo "$line" && break
+        done
+}
+
+CC_STATE=absent
+OR_STATE=absent
+DS_STATE=absent
+[[ -n "$TOKEN" ]] && resolve "$TMP_CC" "$CC_CACHE" CC_STATE
 [[ -n "$OR_KEY" ]] && resolve "$TMP_OR" "$OR_CACHE" OR_STATE
 [[ -n "$DS_KEY" ]] && resolve "$TMP_DS" "$DS_CACHE" DS_STATE
 
-mark() { case "$1" in stale) printf '⏳';; down) printf '⚠️';; esac; }
-
-# --- Working-state: any session JSONL touched in last 90s ⇒ a turn is in flight.
-if find "$CLAUDE_DIR/projects" -name '*.jsonl' -newermt '90 seconds ago' -print -quit 2>/dev/null | grep -q .; then
+if recent_jsonl "$CLAUDE_DIR/projects" || recent_jsonl "$CODEX_DIR/sessions"; then
     DOT="🔴 "
 else
     DOT="⚪ "
 fi
 
-# --- Format ISO timestamp → human "in 4d3h" / "in 8m".
-remaining() {
-    local ts="$1"
-    [[ -z "$ts" || "$ts" == "null" ]] && return
-    local clean="${ts%%.*}"; clean="${clean%%+*}"; clean="${clean%Z}"
-    local epoch
-    epoch=$(date -u -j -f "%Y-%m-%dT%H:%M:%S" "$clean" "+%s" 2>/dev/null) || return
-    local diff=$(( epoch - $(date "+%s") ))
-    if   (( diff <= 0 ));    then echo "now"
-    elif (( diff < 3600 ));  then echo "$((diff / 60))m"
-    elif (( diff < 86400 )); then echo "$((diff / 3600))h$((diff % 3600 / 60))m"
-    else echo "$((diff / 86400))d$((diff % 86400 / 3600))h"
-    fi
-}
-
-# --- OR segment ---
 case "$OR_STATE" in
     absent) OR_SEG="OR:no key" ;;
-    down)   OR_SEG="$(mark down)OR:" ;;
-    ok|stale)
-        { read -r OR_TOTAL; read -r OR_USED; } < <(
-            jq -r '.data.total_credits // 0, .data.total_usage // 0' "$OR_CACHE"
-        )
-        read -r OR_USED_FMT OR_TOTAL_FMT < <(
-            awk -v u="$OR_USED" -v t="$OR_TOTAL" 'BEGIN{ printf "%.2f %.0f", u, t }'
-        )
-        OR_SEG="$(mark "$OR_STATE")OR:\$${OR_USED_FMT}/\$${OR_TOTAL_FMT}"
+    down) OR_SEG="$(mark down)OR:" ;;
+    *)
+        read -r OR_TOTAL OR_USED < <(jq -r '[.data.total_credits // 0, .data.total_usage // 0] | @tsv' "$OR_CACHE")
+        OR_SEG="$(mark "$OR_STATE")OR:\$$(printf '%.2f' "$OR_USED")/\$$(printf '%.0f' "$OR_TOTAL")"
         ;;
 esac
 
-# --- DS segment ---
 case "$DS_STATE" in
     absent) DS_SEG="DS:no key" ;;
-    down)   DS_SEG="$(mark down)DS:" ;;
-    ok|stale)
-        read -r DS_BALANCE DS_CURRENCY < <(
-            jq -r '.balance_infos[0].total_balance // "0",
-                   .balance_infos[0].currency    // "CNY"' "$DS_CACHE"
-        )
-        read -r DS_BAL_FMT < <(awk -v b="$DS_BALANCE" 'BEGIN{ printf "%.2f", b }')
-        DS_SEG="$(mark "$DS_STATE")DS:¥${DS_BAL_FMT}"
-        ;;
-esac
-
-# --- CC segment ---
-case "$CC_STATE" in
-    absent|down) CC_SEG="$(mark "$CC_STATE")CC:" ;;
+    down) DS_SEG="$(mark down)DS:" ;;
     *)
-        { read -r FIVE_UTIL; read -r SEVEN_UTIL; read -r FIVE_RESET; read -r SEVEN_RESET; } < <(
-            jq -r '.five_hour.utilization // 0,
-                   .seven_day.utilization // 0,
-                   .five_hour.resets_at   // "",
-                   .seven_day.resets_at   // ""' "$CC_CACHE"
-        )
-        FIVE_PCT=$(printf '%.0f' "$FIVE_UTIL")
-        SEVEN_PCT=$(printf '%.0f' "$SEVEN_UTIL")
-        FIVE_REM=$(remaining "$FIVE_RESET")
-        SEVEN_REM=$(remaining "$SEVEN_RESET")
-        if [[ -z "$FIVE_REM" && -z "$SEVEN_REM" ]]; then
-            CC_SEG="$(mark "$CC_STATE")CC: 7d:${SEVEN_PCT}% 5h:${FIVE_PCT}%"
-        else
-            CC_SEG="$(mark "$CC_STATE")CC: 7d:${SEVEN_PCT}%(${SEVEN_REM}) 5h:${FIVE_PCT}%(${FIVE_REM})"
-        fi
+        DS_BALANCE=$(jq -r '.balance_infos[0].total_balance // 0' "$DS_CACHE")
+        DS_SEG="$(mark "$DS_STATE")DS:¥$(printf '%.2f' "$DS_BALANCE")"
         ;;
 esac
 
-echo "${DOT}${OR_SEG} ${DS_SEG} ${CC_SEG} | font=BerkeleyMono-Bold size=13"
+case "$CC_STATE" in
+    absent | down) CC_SEG="$(mark "$CC_STATE")CC:" ;;
+    *)
+        read -r CC_7D CC_5H CC_7D_RESET CC_5H_RESET < <(
+            jq -r '[.seven_day.utilization // 0, .five_hour.utilization // 0, .seven_day.resets_at // "", .five_hour.resets_at // ""] | @tsv' "$CC_CACHE"
+        )
+        CC_SEG="$(usage_segment CC "$CC_7D" "$CC_5H" "$CC_7D_RESET" "$CC_5H_RESET" "$CC_STATE")"
+        ;;
+esac
+
+CODEX_LINE=$(codex_line)
+if [[ -n "$CODEX_LINE" ]]; then
+    read -r CODEX_7D CODEX_5H CODEX_7D_RESET CODEX_5H_RESET < <(
+        printf '%s\n' "$CODEX_LINE" |
+            jq -r '(.rate_limits // .payload.rate_limits) | [.secondary.used_percent // 0, .primary.used_percent // 0, .secondary.resets_at // "", .primary.resets_at // ""] | @tsv'
+    )
+    CODEX_SEG="$(usage_segment Codex "$CODEX_7D" "$CODEX_5H" "$CODEX_7D_RESET" "$CODEX_5H_RESET" ok)"
+else
+    CODEX_SEG="Codex:no data"
+fi
+
+echo "${DOT}${OR_SEG} ${DS_SEG} ${CC_SEG} ${CODEX_SEG} | font=BerkeleyMono-Bold size=13"
