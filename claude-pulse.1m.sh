@@ -95,9 +95,17 @@ countdown() {
     echo "$((seconds_left / 86400))d$((seconds_left % 86400 / 3600))h"
 }
 
+# Append "(countdown)" after a percent when a reset is worth showing: always for a
+# fixed window (win==0, e.g. Claude's weekly reset), but for a rolling window
+# (win>0, Codex) only once it has non-zero usage — an idle rolling window's reset
+# is just noise.
+quota_reset() {
+    local left="$1" pct="$2" win="$3"
+    [[ -n "$left" ]] && ((win == 0 || $(printf '%.0f' "$pct") > 0)) && printf '(%s)' "$left"
+}
+
 # Render a two-window quota segment: "<icon><label>: 7d:N% 5h:N%", each percent
-# trailed by its reset countdown — but only when non-zero, since a countdown for
-# an idle (rolling) window is just noise. Shared by the Claude and Codex modules.
+# trailed by its reset countdown (see quota_reset). Shared by Claude and Codex.
 # Args: label seven five seven_reset five_reset state [seven_window] [five_window]
 render_quota() {
     local label="$1" seven="$2" five="$3" seven_reset="$4" five_reset="$5" state="$6"
@@ -106,9 +114,9 @@ render_quota() {
     seven_left=$(countdown "$seven_reset" "$seven_win")
     five_left=$(countdown "$five_reset" "$five_win")
     printf '%s%s: 7d:%.0f%%' "$(state_icon "$state")" "$label" "$seven"
-    [[ -n "$seven_left" ]] && (($(printf '%.0f' "$seven") > 0)) && printf '(%s)' "$seven_left"
+    quota_reset "$seven_left" "$seven" "$seven_win"
     printf ' 5h:%.0f%%' "$five"
-    [[ -n "$five_left" ]] && (($(printf '%.0f' "$five") > 0)) && printf '(%s)' "$five_left"
+    quota_reset "$five_left" "$five" "$five_win"
 }
 
 # Working-state dot: red when a Claude or Codex session wrote in the last 90s.
