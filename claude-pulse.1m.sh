@@ -28,8 +28,7 @@ CODEX_POLL="$CACHE_DIR/claude-pulse-codex-poll.json"   # persistent live-poll ca
 # headers of an accepted /responses POST (one minimal generation per poll). Poll
 # at most every CODEX_TTL seconds, or when a window's reset is due, to bound cost.
 CODEX_TTL=600
-CODEX_W5H=18000    # primary window: 5h, in seconds
-CODEX_W7D=604800   # secondary window: 7d, in seconds
+CODEX_W7D=604800
 
 FONT="BerkeleyMono-Bold size=13"
 
@@ -184,11 +183,11 @@ claude_segment() {
     esac
 }
 
-# ---- Codex: 7d / 5h quota, reconstructed from two sources ----
+# ---- Codex: 7d quota, reconstructed from two sources ----
 # Free: the newest session rollout's last token_count rate_limits (instant when
 # you actually run Codex). Authoritative: a gated live header poll that also
 # catches off-machine / cloud / rescue-runtime usage leaving no local rollout.
-# Both normalize to {p,s,pr,sr,ts}: 5h/7d used-percent, 5h/7d reset epoch, snapshot time.
+# Both normalize to {s,sr,ts}: used-percent, reset epoch, snapshot time.
 # codex_fetch owns all I/O — poll, scan, and resolve the fresher into CODEX_CACHE —
 # so codex_segment is pure render, like every other module.
 
@@ -200,11 +199,11 @@ codex_rollout_json() {
         while IFS= read -r file; do
             ts=$(stat -f '%m' "$file")
             line=$(jq -c --argjson ts "$ts" '
-                (.rate_limits // .payload.rate_limits) | select(.primary and .secondary)
-                | { p:  ((.primary.used_percent   | numbers) // 0),
-                    s:  ((.secondary.used_percent | numbers) // 0),
-                    pr: ((.primary.resets_at      | numbers) // 0),
-                    sr: ((.secondary.resets_at    | numbers) // 0),
+                (.rate_limits // .payload.rate_limits)
+                | [ .primary, .secondary ]
+                | map(select(. != null and (.window_minutes // 0) >= 1440))
+                | first
+                | { s:  (.used_percent // 0), sr: (.resets_at // 0),
                     ts: $ts }' "$file" 2>/dev/null | tail -n 1)
             [[ -n "$line" ]] && { printf '%s' "$line"; break; }
         done
@@ -213,7 +212,7 @@ codex_rollout_json() {
 # One minimal accepted generation; read the x-codex-* headers. store:false writes
 # no rollout. Writes CODEX_POLL on success, leaves it untouched on failure.
 codex_poll_live() {
-    local token acc model hdr now p s pr sr pra sra
+    local token acc model hdr now
     read -r token acc < <(jq -r '[.tokens.access_token // "", .tokens.account_id // ""] | @tsv' "$CODEX_DIR/auth.json" 2>/dev/null)
     [[ -z "$token" ]] && return 1
     model=$(awk -F'"' '/^model[[:space:]]*=/{print $2; exit}' "$CODEX_DIR/config.toml" 2>/dev/null)
@@ -233,31 +232,42 @@ codex_poll_live() {
         local v; v=$(grep -i "^$1:" "$hdr" | tail -1 | tr -d '\r' | sed -E "s/^[^:]+:[[:space:]]*//")
         [[ $v =~ ^[0-9]+([.][0-9]+)?$ ]] && printf '%s' "$v"
     }
-    p=$(hv x-codex-primary-used-percent)
-    s=$(hv x-codex-secondary-used-percent)
-    pr=$(hv x-codex-primary-reset-at);   pra=$(hv x-codex-primary-reset-after-seconds)
-    sr=$(hv x-codex-secondary-reset-at); sra=$(hv x-codex-secondary-reset-after-seconds)
+    now=$(date "+%s")
+    local pu su pw sw pra sra prf srf used reset
+    pu=$(hv x-codex-primary-used-percent);         su=$(hv x-codex-secondary-used-percent)
+    pw=$(hv x-codex-primary-window-minutes);       sw=$(hv x-codex-secondary-window-minutes)
+    pra=$(hv x-codex-primary-reset-at);            sra=$(hv x-codex-secondary-reset-at)
+    prf=$(hv x-codex-primary-reset-after-seconds); srf=$(hv x-codex-secondary-reset-after-seconds)
     rm -f "$hdr"
 
-    [[ -z "$p" ]] && return 1   # no headers => request rejected / auth stale
-    now=$(date "+%s")
-    # Prefer absolute reset-at; treat empty or 0 as unknown and fall back to
-    # now + reset-after-seconds.
-    [[ ( -z "$pr" || "$pr" == 0 ) && -n "$pra" && "$pra" != 0 ]] && pr=$((now + pra))
-    [[ ( -z "$sr" || "$sr" == 0 ) && -n "$sra" && "$sra" != 0 ]] && sr=$((now + sra))
-    jq -n --argjson p "${p:-0}" --argjson s "${s:-0}" \
-          --argjson pr "${pr:-0}" --argjson sr "${sr:-0}" --argjson ts "$now" \
-          '{p:$p,s:$s,pr:$pr,sr:$sr,ts:$ts}' >"$CODEX_POLL"
+    [[ -z "$pu" && -z "$su" ]] && return 1
+
+    # Resolve a slot's reset epoch: absolute reset-at, else now + reset-after, else 0.
+    reset_epoch() { local r="$1" a="$2"
+        if [[ -n "$r" && "$r" != 0 ]]; then printf '%s' "$r"
+        elif [[ -n "$a" && "$a" != 0 ]]; then printf '%s' "$((now + a))"
+        else printf '0'; fi
+    }
+    if [[ -n "$pw" ]] && (( ${pw%.*} >= 1440 )); then
+        used="${pu:-0}"; reset=$(reset_epoch "$pra" "$prf")
+    elif [[ -n "$sw" ]] && (( ${sw%.*} >= 1440 )); then
+        used="${su:-0}"; reset=$(reset_epoch "$sra" "$srf")
+    else
+        return 1
+    fi
+
+    jq -n --argjson s "$used" --argjson sr "$reset" --argjson ts "$now" \
+          '{s:$s,sr:$sr,ts:$ts}' >"$CODEX_POLL"
 }
 
 codex_fetch() {
-    local now ts=0 pr=0 sr=0 poll="" poll_ts=0 roll roll_ts=0
+    local now ts=0 sr=0 poll="" poll_ts=0 roll roll_ts=0
     now=$(date "+%s")
 
-    # 1. Live poll only when it can change the answer: no cache, past TTL, or either
+    # 1. Live poll only when it can change the answer: no cache, past TTL, or the
     #    window's reset is due (replace a stale pre-reset percent with the live one).
-    [[ -s "$CODEX_POLL" ]] && read -r ts pr sr < <(jq -r '[.ts // 0, .pr // 0, .sr // 0] | @tsv' "$CODEX_POLL" 2>/dev/null)
-    if ((!ts || now - ts >= CODEX_TTL)) || ((pr > 0 && now >= pr)) || ((sr > 0 && now >= sr)); then
+    [[ -s "$CODEX_POLL" ]] && read -r ts sr < <(jq -r '[.ts // 0, .sr // 0] | @tsv' "$CODEX_POLL" 2>/dev/null)
+    if ((!ts || now - ts >= CODEX_TTL)) || ((sr > 0 && now >= sr)); then
         codex_poll_live
     fi
 
@@ -275,15 +285,16 @@ codex_fetch() {
 }
 
 codex_segment() {
-    local state now used5 used7 reset5 reset7
+    local state now used reset left
     state=$(get_state "$CODEX_CACHE")
     [[ "$state" == ok ]] || { printf 'Codex:no data'; return; }
     now=$(date "+%s")
-    read -r used5 used7 reset5 reset7 < <(jq -r '[.p, .s, .pr, .sr] | @tsv' "$CODEX_CACHE")
+    read -r used reset < <(jq -r '[.s, .sr] | @tsv' "$CODEX_CACHE")
     # An elapsed window has reset; show 0 rather than the stale pre-reset percent.
-    ((reset5 > 0 && now >= reset5)) && used5=0
-    ((reset7 > 0 && now >= reset7)) && used7=0
-    render_quota Codex "$used7" "$used5" "$reset7" "$reset5" "$state" "$CODEX_W7D" "$CODEX_W5H"
+    ((reset > 0 && now >= reset)) && used=0
+    left=$(countdown "$reset" "$CODEX_W7D")
+    printf 'Codex: 7d:%.0f%%' "$used"
+    quota_reset "$left" "$used" "$CODEX_W7D"
 }
 
 # =========================== 4. display ===============================
