@@ -21,14 +21,9 @@ CACHE_DIR="${TMPDIR:-/tmp}"
 OR_CACHE="$CACHE_DIR/claude-pulse-or.json"
 DS_CACHE="$CACHE_DIR/claude-pulse-ds.json"
 CC_CACHE="$CACHE_DIR/claude-pulse-cc.json"
-CODEX_CACHE="$CACHE_DIR/claude-pulse-codex.json"        # resolved snapshot the segment renders
-CODEX_POLL="$CACHE_DIR/claude-pulse-codex-poll.json"   # persistent live-poll cache; drives the TTL gate
+CODEX_CACHE="$CACHE_DIR/claude-pulse-codex.json"        # snapshot the segment renders
 
-# Codex has no free usage endpoint; its quota rides on the x-codex-* response
-# headers of an accepted /responses POST (one minimal generation per poll). Poll
-# at most every CODEX_TTL seconds, or when a window's reset is due, to bound cost.
-CODEX_TTL=600
-CODEX_W7D=604800
+CODEX_W7D=604800   # weekly window length, seconds; rolls a stale reset forward
 
 FONT="BerkeleyMono-Bold size=13"
 
@@ -183,101 +178,34 @@ claude_segment() {
     esac
 }
 
-# ---- Codex: 7d quota, reconstructed from two sources ----
-# Free: the newest session rollout's last token_count rate_limits (instant when
-# you actually run Codex). Authoritative: a gated live header poll that also
-# catches off-machine / cloud / rescue-runtime usage leaving no local rollout.
-# Both normalize to {s,sr,ts}: used-percent, reset epoch, snapshot time.
-# codex_fetch owns all I/O — poll, scan, and resolve the fresher into CODEX_CACHE —
-# so codex_segment is pure render, like every other module.
-
-# Newest rollout snapshot, normalized; empty if no recent rollout. ts = file mtime.
-codex_rollout_json() {
-    local file ts line
-    find "$CODEX_DIR/sessions" -type f -name '*.jsonl' -mtime -7 -exec stat -f $'%m\t%N' {} + 2>/dev/null |
-        sort -rn | cut -f2- |
-        while IFS= read -r file; do
-            ts=$(stat -f '%m' "$file")
-            line=$(jq -c --argjson ts "$ts" '
-                (.rate_limits // .payload.rate_limits)
-                | [ .primary, .secondary ]
-                | map(select(. != null and (.window_minutes // 0) >= 1440))
-                | first
-                | { s:  (.used_percent // 0), sr: (.resets_at // 0),
-                    ts: $ts }' "$file" 2>/dev/null | tail -n 1)
-            [[ -n "$line" ]] && { printf '%s' "$line"; break; }
-        done
-}
-
-# One minimal accepted generation; read the x-codex-* headers. store:false writes
-# no rollout. Writes CODEX_POLL on success, leaves it untouched on failure.
-codex_poll_live() {
-    local token acc model hdr now
-    read -r token acc < <(jq -r '[.tokens.access_token // "", .tokens.account_id // ""] | @tsv' "$CODEX_DIR/auth.json" 2>/dev/null)
-    [[ -z "$token" ]] && return 1
-    model=$(awk -F'"' '/^model[[:space:]]*=/{print $2; exit}' "$CODEX_DIR/config.toml" 2>/dev/null)
-    [[ -z "$model" ]] && model="gpt-5.5"
-
-    hdr=$(mktemp)
-    curl -s --max-time 6 -D "$hdr" -o /dev/null -X POST \
-        -H "Authorization: Bearer $token" -H "chatgpt-account-id: $acc" \
-        -H "Content-Type: application/json" -H "OpenAI-Beta: responses=experimental" \
-        -H "originator: codex_cli_rs" -H "User-Agent: codex_cli_rs" \
-        -H "session_id: 00000000-0000-0000-0000-000000000000" \
-        -d '{"model":"'"$model"'","instructions":"x","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}],"stream":true,"store":false,"reasoning":{"effort":"low"}}' \
-        "https://chatgpt.com/backend-api/codex/responses"
-
-    # Read one header value, numeric only (blank/garbage -> empty, never breaks jq).
-    hv() {
-        local v; v=$(grep -i "^$1:" "$hdr" | tail -1 | tr -d '\r' | sed -E "s/^[^:]+:[[:space:]]*//")
-        [[ $v =~ ^[0-9]+([.][0-9]+)?$ ]] && printf '%s' "$v"
-    }
-    now=$(date "+%s")
-    local pu su pw sw pra sra prf srf used reset
-    pu=$(hv x-codex-primary-used-percent);         su=$(hv x-codex-secondary-used-percent)
-    pw=$(hv x-codex-primary-window-minutes);       sw=$(hv x-codex-secondary-window-minutes)
-    pra=$(hv x-codex-primary-reset-at);            sra=$(hv x-codex-secondary-reset-at)
-    prf=$(hv x-codex-primary-reset-after-seconds); srf=$(hv x-codex-secondary-reset-after-seconds)
-    rm -f "$hdr"
-
-    [[ -z "$pu" && -z "$su" ]] && return 1
-
-    # Resolve a slot's reset epoch: absolute reset-at, else now + reset-after, else 0.
-    reset_epoch() { local r="$1" a="$2"
-        if [[ -n "$r" && "$r" != 0 ]]; then printf '%s' "$r"
-        elif [[ -n "$a" && "$a" != 0 ]]; then printf '%s' "$((now + a))"
-        else printf '0'; fi
-    }
-    if [[ -n "$pw" ]] && (( ${pw%.*} >= 1440 )); then
-        used="${pu:-0}"; reset=$(reset_epoch "$pra" "$prf")
-    elif [[ -n "$sw" ]] && (( ${sw%.*} >= 1440 )); then
-        used="${su:-0}"; reset=$(reset_epoch "$sra" "$srf")
-    else
-        return 1
-    fi
-
-    jq -n --argjson s "$used" --argjson sr "$reset" --argjson ts "$now" \
-          '{s:$s,sr:$sr,ts:$ts}' >"$CODEX_POLL"
-}
-
+# ---- Codex: 7d plan quota, reconstructed from session rollouts ----
+# Codex has no usage endpoint; the number lives in the rate_limits of each session's
+# token_count events, tagged with the event's own ISO-8601 timestamp and written
+# whenever you run Codex. The live snapshot is the "codex" weekly entry with the latest
+# timestamp. Ranking on the event time, not the peak used_percent, lets the bar follow
+# a reset or refund downward; ranking on the event time, not the file mtime, keeps a
+# resumed old session from winning with a stale entry. The limit_id filter drops an
+# experimental bucket (codex_bengalfox, the GPT-5.3-Codex-Spark model) that sits at 0%
+# unrelated to the plan quota. A window reset just zeroes used_percent in the next
+# rollout; codex_segment and countdown cover a pre-reset snapshot until then.
+#
+# Rollout files run to gigabytes and rate_limits appears on nearly every line, so
+# reading them whole costs ~25s. The latest reading is always near a file's end, so
+# read only each file's tail: bounded work regardless of file size.
 codex_fetch() {
-    local now ts=0 sr=0 poll="" poll_ts=0 roll roll_ts=0
-    now=$(date "+%s")
-
-    # 1. Live poll only when it can change the answer: no cache, past TTL, or the
-    #    window's reset is due (replace a stale pre-reset percent with the live one).
-    [[ -s "$CODEX_POLL" ]] && read -r ts sr < <(jq -r '[.ts // 0, .sr // 0] | @tsv' "$CODEX_POLL" 2>/dev/null)
-    if ((!ts || now - ts >= CODEX_TTL)) || ((sr > 0 && now >= sr)); then
-        codex_poll_live
-    fi
-
-    # 2. Resolve the fresher of poll-cache vs newest rollout into the display cache.
-    [[ -s "$CODEX_POLL" ]] && { poll=$(cat "$CODEX_POLL"); poll_ts=$(jq -r '.ts // 0' <<<"$poll"); }
-    roll=$(codex_rollout_json)
-    [[ -n "$roll" ]] && roll_ts=$(jq -r '.ts // 0' <<<"$roll")
-    if [[ -n "$poll" ]] && ((poll_ts >= roll_ts)); then
-        printf '%s' "$poll" >"$CODEX_CACHE"; set_state "$CODEX_CACHE" ok
-    elif [[ -n "$roll" ]]; then
+    local roll
+    roll=$(
+        find "$CODEX_DIR/sessions" -type f -name '*.jsonl' -mtime -7 2>/dev/null |
+            while IFS= read -r f; do tail -n 400 "$f"; done |
+            jq -c '
+                (.rate_limits // .payload.rate_limits) as $rl
+                | select($rl != null) | select(($rl.limit_id // "codex") == "codex")
+                | (.timestamp // .payload.timestamp // "") as $t
+                | ($rl.primary, $rl.secondary)
+                | select(type == "object" and (.window_minutes // 0) >= 1440)
+                | { t: $t, s: (.used_percent // 0), sr: (.resets_at // 0) }' 2>/dev/null |
+            jq -s '(max_by(.t) // empty) | {s, sr}')
+    if [[ -n "$roll" ]]; then
         printf '%s' "$roll" >"$CODEX_CACHE"; set_state "$CODEX_CACHE" ok
     else
         set_state "$CODEX_CACHE" down
